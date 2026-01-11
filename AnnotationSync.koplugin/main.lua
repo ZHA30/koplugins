@@ -1,0 +1,259 @@
+local docsettings = require("frontend/docsettings")
+local UIManager = require("ui/uimanager")
+local Dispatcher = require("dispatcher")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local T = require("ffi/util").template
+local SyncService = require("apps/cloudstorage/syncservice")
+local util = require("util")
+local lfs = require("libs/libkoreader-lfs")
+local _ = require("gettext")
+local DataStorage = require("datastorage")
+
+local annotations = require("annotations")
+local remote = require("remote")
+local utils = require("utils")
+
+local AnnotationSyncPlugin = WidgetContainer:extend {
+    name = "AnnotationSync",
+    is_doc_only = true,
+    _changed_documents = {}, -- Track changed documents
+}
+
+function AnnotationSyncPlugin:init()
+    self.ui.menu:registerToMainMenu(self)
+    utils.insert_after_statistics("annotation_sync_plugin")
+    self:onDispatcherRegisterActions()
+end
+
+function AnnotationSyncPlugin:addToMainMenu(menu_items)
+    menu_items.annotation_sync_plugin = {
+        text = _("批注同步"),
+        sorting_hint = "tools",
+        sub_item_table = { {
+            text = _("设置"),
+            sub_item_table = { {
+                text = _("云存储设置"),
+                callback = function()
+                    local sync_service = SyncService:new {}
+                    sync_service.onConfirm = function(server)
+                        self:onSyncServiceConfirm(server)
+                    end
+                    UIManager:show(sync_service)
+                end
+            }, {
+                text = _("使用文件名而非哈希值"),
+                checked_func = function()
+                    return G_reader_settings:isTrue("annotation_sync_use_filename")
+                end,
+                callback = function()
+                    local current = G_reader_settings:isTrue("annotation_sync_use_filename")
+                    G_reader_settings:saveSetting("annotation_sync_use_filename", not current)
+                    UIManager:close()
+                end
+            } }
+        }, {
+            text = _("手动同步"),
+            enabled = (G_reader_settings:readSetting("cloud_download_dir") or "") ~= "",
+            callback = function()
+                self:manualSync()
+            end
+        }, {
+            text = _("全部同步"),
+            enabled = true,
+            callback = function()
+                self:syncAllChangedDocuments()
+            end
+        } }
+    }
+    -- Sync all changed documents listed in changed_documents.lua
+    local DocumentRegistry = require("document/documentregistry")
+
+    function AnnotationSyncPlugin:syncAllChangedDocuments()
+        local data_dir = DataStorage:getDataDir()
+        local track_path = data_dir .. "/changed_documents.lua"
+        local ok, changed_docs = pcall(dofile, track_path)
+        if not ok or type(changed_docs) ~= "table" then
+            utils.show_msg("没有变更文档需要同步。")
+            return
+        end
+        local total = 0
+        for _ in pairs(changed_docs) do total = total + 1 end
+        if total == 0 then
+            utils.show_msg("没有变更文档需要同步。")
+            return
+        end
+        local count = 0
+        for file, _ in pairs(changed_docs) do
+            -- Try to get a document object for this file, open if needed
+            local document = self:getDocumentByFile(file)
+            if not document then
+                document = DocumentRegistry:openDocument(file)
+            end
+            if document then
+                self:syncDocument(document)
+                count = count + 1
+            end
+        end
+        if count == 0 then
+            utils.show_msg("存在变更文档，但都无法同步。")
+        else
+            utils.show_msg("已同步 " .. count .. " 个文档。")
+        end
+    end
+
+    -- Helper to sync a document (same as manualSync but for a given document)
+    function AnnotationSyncPlugin:syncDocument(document)
+        local file = document and document.file
+        if not file then return end
+        local use_filename = G_reader_settings:isTrue("annotation_sync_use_filename")
+        local sdr_dir = docsettings:getSidecarDir(file)
+        if not sdr_dir or sdr_dir == "" then return end
+        local stored_annotations = document.annotation and document.annotation.annotations or {}
+        local annotation_filename
+        if use_filename then
+            local filename = file:match("([^/]+)$") or file
+            annotation_filename = filename .. ".json"
+        else
+            local hash = file and type(file) == "string" and util.partialMD5(file) or _("无哈希值")
+            annotation_filename = hash .. ".json"
+        end
+        local json_path = sdr_dir .. "/" .. annotation_filename
+        annotations.write_annotations_json(document, stored_annotations, sdr_dir, annotation_filename)
+        remote.sync_annotations(self, json_path)
+        -- Remove from changed_documents.lua if present (very last action)
+        local data_dir = DataStorage:getDataDir()
+        local track_path = data_dir .. "/changed_documents.lua"
+        local changed_docs = {}
+        local ok, loaded = pcall(dofile, track_path)
+        if ok and type(loaded) == "table" then
+            changed_docs = loaded
+        end
+        if changed_docs[file] then
+            changed_docs[file] = nil
+            local f = io.open(track_path, "w")
+            if f then
+                f:write("return ", serialize_table(changed_docs), "\n")
+                f:close()
+            end
+        end
+    end
+
+    -- Helper to get a document object by file path (stub, needs integration with document management)
+    function AnnotationSyncPlugin:getDocumentByFile(file)
+        -- This is a stub. Replace with actual lookup if available.
+        -- If only the current document is available, return it if it matches.
+        local document = self.ui and self.ui.document
+        if document and document.file == file then
+            return document
+        end
+        return nil
+    end
+end
+
+function AnnotationSyncPlugin:onAnnotationSyncManualSync()
+    self:manualSync()
+    return true
+end
+
+function AnnotationSyncPlugin:onDispatcherRegisterActions()
+    Dispatcher:registerAction("annotation_sync_manual_sync", {
+        category = "none",
+        event = "AnnotationSyncManualSync",
+        title = _("批注同步：手动同步"),
+        text = _("通过批注同步器同步批注和书签。"),
+        separator = true,
+        reader = true
+    })
+end
+
+function AnnotationSyncPlugin:onSyncServiceConfirm(server)
+    remote.save_server_settings(server)
+    if self and self.ui and self.ui.menu and self.ui.menu.showMainMenu then
+        self.ui.menu:showMainMenu()
+    end
+end
+
+function AnnotationSyncPlugin:manualSync()
+    local document = self.ui and self.ui.document
+    local file = document and document.file
+    if not file then
+        utils.show_msg("需要激活文档才能同步。")
+        return
+    end
+
+    local use_filename = G_reader_settings:isTrue("annotation_sync_use_filename")
+    local sdr_dir = docsettings:getSidecarDir(file)
+    if not sdr_dir or sdr_dir == "" then
+        return
+    end
+    local stored_annotations = self.ui.annotation and self.ui.annotation.annotations or {}
+    local annotation_filename
+    if use_filename then
+        local filename = file:match("([^/]+)$") or file
+        annotation_filename = filename .. ".json"
+    else
+        local hash = file and type(file) == "string" and util.partialMD5(file) or _("No hash")
+        annotation_filename = hash .. ".json"
+    end
+    local json_path = sdr_dir .. "/" .. annotation_filename
+    annotations.write_annotations_json(document, stored_annotations, sdr_dir, annotation_filename)
+    remote.sync_annotations(self, json_path)
+
+    -- Remove from changed_documents.lua if present (very last action)
+    local data_dir = DataStorage:getDataDir()
+    local track_path = data_dir .. "/changed_documents.lua"
+    local changed_docs = {}
+    local ok, loaded = pcall(dofile, track_path)
+    if ok and type(loaded) == "table" then
+        changed_docs = loaded
+    end
+    if changed_docs[file] then
+        changed_docs[file] = nil
+        local f = io.open(track_path, "w")
+        if f then
+            f:write("return ", serialize_table(changed_docs), "\n")
+            f:close()
+        end
+    end
+end
+
+function AnnotationSyncPlugin:onAnnotationsModified(payload)
+    -- Try to get the document from the UI context
+    local document = self.ui and self.ui.document
+    if document and document.file then
+        local changed_file = document.file
+        print("Document changed: " .. changed_file)
+        -- Track in a Lua file in the user data directory
+        local data_dir = DataStorage:getDataDir()
+        local track_path = data_dir .. "/changed_documents.lua"
+        -- Load existing table or create new
+        local changed_docs = {}
+        local ok, loaded = pcall(dofile, track_path)
+        if ok and type(loaded) == "table" then
+            changed_docs = loaded
+        end
+        changed_docs[changed_file] = true
+        -- Write table to file
+        local f = io.open(track_path, "w")
+        if f then
+            f:write("return ", serialize_table(changed_docs), "\n")
+            f:close()
+        else
+            print("Failed to open track file: " .. track_path)
+        end
+    else
+        print("Document change detected, but no document context available.")
+    end
+end
+
+-- Helper to serialize a Lua table as code
+function serialize_table(tbl)
+    local result = "{\n"
+    for k, v in pairs(tbl) do
+        result = result .. string.format("  [%q] = %s,\n", k, tostring(v))
+    end
+    result = result .. "}"
+    return result
+end
+
+return AnnotationSyncPlugin
